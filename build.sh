@@ -2,7 +2,7 @@
 
 : ${CC=gcc}
 : ${MAKE=make}
-: ${BIN=lpm}
+: ${BIN=sas}
 : ${JOBS=4}
 
 SRCS="src/*.c"
@@ -24,7 +24,7 @@ fi
 [[ "$@" != *"-llua"* ]] && CFLAGS="$CFLAGS -Ilib/lua -DMAKE_LIB=1" && SRCS="$SRCS lib/lua/onelua.c"
 
 # Build the pre-packaged lua file into the executbale.
-xxd -i src/lpm.lua > src/lpm.lua.c
+xxd -i src/main.lua > src/main.lua.c
 
 [[ $OSTYPE != 'msys'* && $CC != *'mingw'* && $CC != "emcc" ]] && LDFLAGS=" $LDFLAGS -ldl -pthread"
 [[ $OSTYPE == 'msys'* || $CC == *'mingw'* ]] && LDFLAGS="$LDFLAGS -lbcrypt -lws2_32 -lz -lwinhttp -lole32 -lcrypt32 -lrpcrt4"

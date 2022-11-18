@@ -32,28 +32,25 @@ struct SocketSet {
 
 
 static int socketset_new(lua_State *L) {
-  luaL_checktype(L, 1, LUA_TTABLE);
-  int len = luaL_len(L, 1);
   lua_newtable(L);
   struct SocketSet* s = lua_newuserdata(L, sizeof(struct SocketSet));
   lua_setfield(L, -1, "set");
   s->epollfd = epoll_create1(0);
   if (s->epollfd == -1)
-    return luaL_error(L, "can't accept on socket: %s", strerror(errno));
-  for (int i = 1; i < len; ++i) {
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    lua_rawgeti(L, 1, i);
-    luaL_checktype(L, -1, LUA_TTABLE);
-    lua_getfield(L, -1, "socket");
-    ev.data.fd = luaL_checkinteger(L, -1);
-    lua_pop(L, 2);
-    if (epoll_ctl(s->epollfd, EPOLL_CTL_ADD, ev.data.fd, &ev) == -1) {
-      close(s->epollfd);
-      return luaL_error(L, "can't add socket %d: %s", ev.data.fd, strerror(errno));
-    }
-  }
+    return luaL_error(L, "can't create epoll: %s", strerror(errno));
   luaL_setmetatable(L, "socketset");
+  return 1;
+}
+
+static int socketset_add(lua_State* L) {
+  struct epoll_event ev;
+  ev.events = EPOLLIN;
+  luaL_checktype(L, 1, LUA_TTABLE);
+  lua_getfield(L, 1, "socket");
+  ev.data.fd = luaL_checkinteger(L, -1);
+  lua_pop(L, 1);
+  if (epoll_ctl(s->epollfd, EPOLL_CTL_ADD, ev.data.fd, &ev) == -1)
+    return luaL_error(L, "can't add socket %d: %s", ev.data.fd, strerror(errno));
   return 1;
 }
 
@@ -265,6 +262,7 @@ static int socket_recv(lua_State* L) {
 
 static const luaL_Reg socketset_lib[] = {
   { "new",       socketset_new   },  // Creates a socket set which poll should be called on.
+  { "add",       socketset_add   },  // Adds a socket to the set.
   { "__gc",      socketset_close },  // Closes the socket set.
   { "poll",      socketset_poll  },  // Blocking poll. Returns the socket that matches this event.
   { NULL,        NULL            }
@@ -305,9 +303,11 @@ int main(int argc, char* argv[]) {
   lua_setglobal(L, "PATHSEP");
   lua_setglobal(L, "PLATFORM");
   #if SAS_LIVE
+  lua_pushboolean(L, 1);
+  lua_setglobal(L, "LIVE");
   if (luaL_loadfile(L, "src/main.lua") || lua_pcall(L, 0, 1, 0)) {
   #else
-  if (luaL_loadbuffer(L, src_lpm_lua, src_lpm_lua_len, "main.lua") || lua_pcall(L, 0, 1, 0)) {
+  if (luaL_loadbuffer(L, src_main_lua, src_main_lua_len, "main.lua") || lua_pcall(L, 0, 1, 0)) {
   #endif
     fprintf(stderr, "internal error when starting the application: %s\n", lua_tostring(L, -1));
     return -1;
