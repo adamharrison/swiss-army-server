@@ -5,6 +5,7 @@ local FORWARD_CHUNK_SIZE = 4096
 local HEADER_CHUNK_SIZE = 4096
 local MAX_HEADER_SIZE = 4096
 local CAN_READ, CAN_WRITE = 1, 2
+local SS
 
 local common = {}
 function common.args(arguments, options, start_index, end_index)
@@ -61,7 +62,7 @@ local codes = {
   [418] = "I'm a Teapot", [421] = "Misdirected Request", [422] = "Unprocessable Entity", [423] = "Locked", [424] = "Failed Dependency", [425] = "Too Early", [426] = "Upgrade Required", [428] = "Precondition Required", [429] = "Too Many Requests",
   [431] = "Request Header Fields Too Large", [451] = "Unavailable For Legal Reasons",
   [500] = "Internal Server Error", [501] = "Not Implemented", [502] = "Bad Gateway", [503] = "Services Unavaialable", [504] = "Gateway Timeout", [505] = "HTTP Version Not Supported", [506] = "Variant Also Negotiates", [507] = "Insufficient Storage",
-  [507] = "Insufficient Storage", [508] = "Loop Detected", [510] = "Not Extended", [511] = "Network Authentication Required"
+  [507] = "Insufficient Storage", [508] = "Loop Detected", [510] = "Not Extended", [511] = "Network Authentication Required", [512] = "Bad Gateway"
 }
 
 function Request.parse(socket)
@@ -103,6 +104,12 @@ function Request.write(socket, method, path, headers)
   for k,v in pairs(headers or {}) do chunk = chunk .. (k .. ": " .. v .. "\r\n") end
   chunk = chunk .. "\r\n"
   table.insert(socket.obuf, chunk)
+end
+
+
+function Response.parse(socket)
+  local headers = {}
+  
 end
 
 function Response.write(socket, code, headers)
@@ -156,12 +163,12 @@ function Socket:flush()
 end
 
 local mime_types = {
-  aac = "audio/aac", abw = "application/x-abiword", arc = "application/x-freearc", avif = "image/avif", avi = "application/vnd.amazon.ebook", bin = "application/octet-stream", bmp = "image/bmp", bz = "application/x-bzip", bz2 = "application/x-bzip2", cda = "application/x-cdf", 
+  aac = "audio/aac", abw = "application/x-abiword", arc = "application/x-freearc", avif = "image/avif", avi = "application/vnd.amazon.ebook", bmp = "image/bmp", bz = "application/x-bzip", bz2 = "application/x-bzip2", cda = "application/x-cdf", 
   csh = "application/x-csh", css = "text/css", csv = "text/csv", doc = "application/msword", docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document", eot = "application/vnd.ms-fontobject", epub  = "application/epub+zip", gz = "application/gzip", gif = "image/gif",
   htm = "text/html", html = "text/html", ico = "image/vnd.microsoft.icon", ics = "text/calendar", jar = "application/java-archive", jpeg = "image/jpeg", jpg = "image/jpeg", js = "text/javascript", json = "application/json", jsonld = "application/ld+json", mid = "audio/midi",
   mjs = "text/javascript", mp3 = "audio/mpeg", mp4 = "video/mp4", mpeg = "video/mpeg", mpkg = "application/vnd.apple.installer+xml", odp = "application/vnd.oasis.opendocument.presentation", ods = "application/vnd.oasis.opendocument.spreadsheet", odt = "application/vnd.oasis.opendocument.text",
   oga = "audio/ogg", ogv = "video/ogg", ogx = "application/ogg", opus = "audio/opus", otf = "font/otf", png = "image/png", pdf = "application/pdf", php = "application/x-httpd-php", ppt = "application/vnd.ms-powerpoint", pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  rar = "application/vnd.rar", rtf = "application/rtf", sh = "application/x-sh", svg = "image/svg+xml", tar = "application/x-tar", tif = ".tiff	image/tiff", ts = "video/mp2t", ttf = "font/ttf", txt = "text/plain", vsd = "application/vnd.visio", wav = "audio/wav", weba = "audio/webm", webm = "video/webm",
+  rar = "application/vnd.rar", rtf = "application/rtf", sh = "application/x-sh", svg = "image/svg+xml", tar = "application/x-tar", tif = "image/tiff", tiff = "image/tiff", ts = "video/mp2t", ttf = "font/ttf", txt = "text/plain", vsd = "application/vnd.visio", wav = "audio/wav", weba = "audio/webm", webm = "video/webm",
   webp = "image/webp", woff = "font/woff", woff2 = "font/woff2", xhtml = "application/xhtml+xml", xls = "application/vnd.ms-excel", xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xml = "application/xml", xul = "application/vnd.mozilla.xul+xml", zip = "application/zip",
   ["3gp"] = "video/3gpp", ["3g2"] = "video/3gpp2", ["7z"] = "application/x-7z-compressed"
 }
@@ -185,10 +192,18 @@ function Request.init(location, socket, method, path, headers) -- Originally cal
     response_headers["Content-Length"] = stat.size
     response_headers["Content-Type"] = get_mime_type(target)
     Response.write(socket, 200, response_headers)
-  elseif location.options.forward then
-    local _, _, protocol, host, port = options.forward:find("^(%w+)://([^:]+):?(%d+)$")
-    socket.forward = { client = Socket.connect(protocol, host, port), length = headers["Content-Length"] } -- this is blocking for now, may want to change this in future.
-    Request.write(socket.forward.client, code, headers)
+  elseif location.options.forward then -- in this case, obuf on the forward client is headed out to upstream, ibuf, returning from upstream.
+    local _, _, protocol, host, port = location.options.forward:find("^(%w+)://([^:]+):?(%d*)$")
+    if not protocol then error("can't parse forwarding string " .. location.options.forward) end
+    local client, err = pcall(Socket.connect, protocol, host, port)  -- this is blocking for now, may want to change this in future.
+    if err then
+      log(err)
+      error({ 512 })
+    end
+    client = SS:add(client)
+    client.ibuf, client.obuf, client.ioff, client.ooff, client.internal = {}, {}, 0, 0, socket
+    socket.forward = { client = client, length = headers["Content-Length"] }
+    Request.write(client, method, path, headers)
   elseif location.options.callback then
     location.options.callback(socket, method, path, headers)
   else
@@ -200,23 +215,30 @@ function Request.init(location, socket, method, path, headers) -- Originally cal
   return { location = location, method = method, path = path, headers = headers }
 end
 
+
+local function drain_buffers(from, from_offset, to)
+  if #from > 0 then
+    table.insert(to, from[1]:sub(from_offset + 1))
+    for i = 2, #from do
+      table.insert(to, from[i])
+    end
+  end
+end
+
 function Request.on_read(socket) -- Called when we have an incoming chunk for the same request.
   if socket.callback then
     return socket.callback(socket)
-  end
-  if socket.forward then
-    if socket.ioff then
-      local chunk = socket.ibuf[1]:sub(socket.ioff)
-      table.insert(socket.forward.obuf, chunk)
-    end
-    for i = 2, #socket.ibuf do
-      table.insert(socket.forward.obuf, socket.ibuf[i])
-    end
-    socket.ibuf = {}
-    socket.forward:flush()
+  elseif socket.forward then -- for when we have a chunk incoming from the actual client
+    drain_buffers(socket.ibuf, socket.ioff, socket.forward.client.obuf)
+    socket.ibuf, socket.ioff = {}, 0
+    socket.forward.client:flush()
+    return false
+  elseif socket.internal then -- for when we have a chunk incoming from the upstream server
+    drain_buffers(socket.ibuf, socket.ioff, socket.internal.obuf)
+    socket.ibuf, socket.ioff = {}, 0
+    socket.internal:flush()
     return false
   end
-  socket.ibuf, socket.ioff = {}, 0
   return true
 end
 
@@ -226,9 +248,15 @@ function Request.on_write(socket) -- Called when we can write outgoing.
     if not chunk then socket.static = nil return true end
     table.insert(socket.obuf, chunk)
     return false
-  end
-  if socket.forward then
-    for i, buf in ipairs(socket.forward.ibuf) do table.insert(socket.obuf, buf) end
+  elseif socket.forward then -- for when we have chunks ready to be head out to the client
+    drain_buffers(socket.forward.client.ibuf, socket.forward.client.ioff, socket.obuf)
+    socket.forward.client.ibuf, socket.forward.client.ioff = {}, 0
+    socket:flush()
+    return true
+  elseif socket.internal then -- for when we have a chunk ready to head to the upstream server
+    drain_buffers(socket.internal.ibuf, socket.internal.ioff, socket.obuf)
+    socket.forward.client.ibuf, socket.forward.client.ioff = {}, 0
+    socket:flush()
     return true
   end
   return true
@@ -349,7 +377,7 @@ Location Flags
   with a % (%q). These can be escaped with backslash.
 
   --static=path       Statically serves content located at the path, if
-0                      the path specified is a directory. If it's a file
+                      the path specified is a directory. If it's a file
                       serves that file.
   --forward=host:port Forwards the HTTP request onto the specified location.
   --timeout=60        Sets the timeout for activity on this location.
@@ -409,7 +437,7 @@ Location Flags
     server_idx = next_server_idx
     table.insert(servers, server)
   end
-  local ss = SocketSet.new()
+  SS = SocketSet.new()
   local sockets, address, port = {}
   for i, server in ipairs(servers) do
     port = select(3, server.options.server:find("^(%d+)$"))
@@ -423,7 +451,7 @@ Location Flags
     elseif server.options.ssl_callback then
       ssl = parse_function_or_path(sever.options.ssl_callback)
     end
-    local socket = ss:add(Socket.listen(address, port, { ssl = ssl }))
+    local socket = SS:add(Socket.listen(address, port, { ssl = ssl }))
     server.socket, socket.server = socket, server
   end
 
@@ -432,7 +460,7 @@ Location Flags
 
   log("Spinning up server...")
   while true do
-    local socket, event = ss:poll(10)
+    local socket, event = SS:poll(10)
     local time = os.time()
     if time - last_active_check > 10 then
       local connections = {}
@@ -451,7 +479,7 @@ Location Flags
     if socket then
       local server, client = socket.server
       if not socket.ibuf then 
-        client = ss:add(socket:accept()) 
+        client = SS:add(socket:accept()) 
         client.ibuf, client.obuf, client.ioff, client.ooff, client.server = {}, {}, 0, 0, server
       else 
         client = socket 
@@ -462,7 +490,7 @@ Location Flags
           local chunk = client:recv(HEADER_CHUNK_SIZE)
           if #chunk > 0 then
             table.insert(client.ibuf, chunk)
-            if not client.request then -- If we don't have an ongoing request.
+            if not client.request and not client.internal then -- If we don't have an ongoing request.
               local version, method, path, headers, body, index, offset = Request.parse(client)
               if version then
                 if index then 

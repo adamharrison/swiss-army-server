@@ -34,6 +34,12 @@ struct SocketSet {
 
 static int socketset_new(lua_State *L) {
   lua_newtable(L);
+  lua_newtable(L);
+  lua_newtable(L);
+  lua_pushliteral(L, "k");
+  lua_setfield(L, -2, "__mode");
+  lua_setmetatable(L, -2);
+  lua_setfield(L, -2, "sockets");
   struct SocketSet* s = lua_newuserdata(L, sizeof(struct SocketSet));
   lua_setfield(L, -2, "set");
   s->epollfd = epoll_create1(0);
@@ -56,9 +62,11 @@ static int socketset_add(lua_State* L) {
   if (epoll_ctl(s->epollfd, EPOLL_CTL_ADD, ev.data.fd, &ev) == -1)
     return luaL_error(L, "can't add socket %d: %s", ev.data.fd, strerror(errno));
   lua_pop(L, 1);
+  lua_getfield(L, 1, "sockets");
   lua_pushinteger(L, ev.data.fd);
-  lua_pushvalue(L ,-2);
-  lua_rawset(L, 1);
+  lua_pushvalue(L ,2);
+  lua_rawset(L, -3);
+  lua_pop(L, 1);
   return 1;
 }
 
@@ -73,8 +81,9 @@ static int socketset_poll(lua_State* L) {
   if (nfds == 0)
     return 0;
   lua_pop(L, 1);
+  lua_getfield(L, 1, "sockets");
   lua_pushinteger(L, s->events[0].data.fd);
-  lua_rawget(L, 1);
+  lua_rawget(L, -2);
   lua_pushinteger(L, ((s->events[0].events & EPOLLIN) ? 1 : 0) | ((s->events[0].events & EPOLLOUT) ? 2 : 0));
   return 2;
 }
@@ -189,19 +198,22 @@ static int socket_connect(lua_State* L) {
   const char* ip = inet_ntoa(dest_addr.sin_addr);
   if (connect(s, (struct sockaddr *) &dest_addr, sizeof(struct sockaddr)) == -1 ) {
     close(s);
-    return luaL_error(L, "can'tc connect to host %s [%s] on port %d", hostname, ip, port);
+    return luaL_error(L, "can't connect to host %s [%s] on port %d", hostname, ip, port);
   }
   lua_newtable(L);
   lua_pushinteger(L, s);
   lua_setfield(L, -2, "socket");
   lua_pushboolean(L, 1);
-  lua_setfield(L, 1, "ctx");
+  lua_setfield(L, -2, "ctx");
   luaL_setmetatable(L, "Socket");
   return 1;
 }
 
 
 static int socket_close(lua_State* L) {
+  if (lua_getfield(L, 1, "closed") && lua_toboolean(L, -1))
+    return 0;
+  lua_pop(L, 1);
   lua_getfield(L, 1, "socket");
   int s = lua_tointeger(L, -1);
   lua_getfield(L, 1, "ctx");
@@ -215,7 +227,8 @@ static int socket_close(lua_State* L) {
     SSL_free(ssl);
   }
   #endif
-  close(s);
+  if (close(s))
+    return luaL_error(L, "can't close socket fd %d: %s", s, strerror(errno));
   lua_pushboolean(L, 1);
   lua_setfield(L, 1, "closed");
   return 0;
@@ -415,6 +428,7 @@ extern const char src_main_lua[];
 extern unsigned int src_main_lua_len;
 int main(int argc, char* argv[]) {
   lua_State* L = luaL_newstate();
+  sigaction(SIGPIPE, &(struct sigaction){SIG_IGN}, NULL);
   luaL_openlibs(L);
   luaL_newmetatable(L, "SocketSet"); luaL_setfuncs(L, socketset_lib, 0); lua_pushvalue(L, -1); lua_setfield(L, -2, "__index"); lua_setglobal(L, "SocketSet");
   luaL_newmetatable(L, "Socket"); luaL_setfuncs(L, socket_lib, 0); lua_pushvalue(L, -1); lua_setfield(L, -2, "__index"); lua_setglobal(L, "Socket");
