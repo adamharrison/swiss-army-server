@@ -1,5 +1,6 @@
 # swiss-army-server
 
+```
 Usage: swiss-army-server [--lots-of-flags]
 
 swiss-army-server is a simple webserver, that can serve static content,
@@ -109,3 +110,5 @@ Location Flags
   --verbose           Dumps requests and responses to STDOUT.
   --gnu               Adds 'X-Clacks-Overhead: GNU Terry Pratchett' header.
   --[get|post|...]    Limits interactions to only these methods.
+
+```

@@ -1,9 +1,10 @@
 setmetatable(_G, { __index = function(t, k) if not rawget(t, k) then error("cannot get undefined global variable: " .. k, 2) end end, __newindex = function(t, k) error("cannot set global variable: " .. k, 2) end  })
 
-local LOCAL_IO_CHUNK_SIZE = 10*4096
+local LOCAL_IO_CHUNK_SIZE = 16*4096
 local FORWARD_CHUNK_SIZE = 4096
 local HEADER_CHUNK_SIZE = 4096
 local MAX_HEADER_SIZE = 4096
+local CAN_READ, CAN_WRITE = 1, 2
 
 local common = {}
 function common.args(arguments, options, start_index, end_index)
@@ -18,8 +19,8 @@ function common.args(arguments, options, start_index, end_index)
       if flag_type == "flag" then
         args[option] = true
       elseif flag_type == "string" or flag_type == "number" then
-        if not value then
-          if i < #arguments then error("option " .. option .. " requires a " .. flag_type) end
+        if not value or value == "" then
+          if i >= #arguments then error("option " .. option .. " requires a " .. flag_type) end
           value = arguments[i+1]
           i = i + 1
         end
@@ -33,14 +34,20 @@ function common.args(arguments, options, start_index, end_index)
   end
   return args
 end
-function common.find(arguments, argument, start_index)
-  for i = start_index or 1, #arguments do
-    if arguments[i]:find("^--" .. argument) then return i end
+function common.find(arguments, argument, start_index, end_index)
+  for i = start_index or 1, end_index or #arguments do
+    if arguments[i]:find("^%-%-" .. argument) then return i end
   end
   return nil
 end
-function common.merge(...) local t = {} for i,a in ipairs({ a }) do for k,v in pairs(a) do t[k] = v end end return t end
+function common.merge(...) local t = {} for i,a in ipairs({ ... }) do for k,v in pairs(a) do t[k] = v end end return t end
 function common.map(l, f) local t = {} for i,v in ipairs(l) do table.insert(l, f(v)) end return t end
+
+local function log(m)
+  io.stdout:write(os.date("[%Y-%m-%dT%H:%M:%S] "))
+  io.stdout:write(m)
+  io.stdout:write("\n")
+end
 
 local Request = {}
 local Response = {}
@@ -57,34 +64,53 @@ local codes = {
   [507] = "Insufficient Storage", [508] = "Loop Detected", [510] = "Not Extended", [511] = "Network Authentication Required"
 }
 
-function Request.parse(message)
+function Request.parse(socket)
   local headers = {}
-  local start_of_header, end_of_header = message:find("\r\n\r\n", 1, true)
+
+  local start_of_header, end_of_header
+  local idx = 1
+  local ibuf = socket.ibuf
+  for idx = 1, #ibuf do
+    start_of_header, end_of_header = ibuf[idx]:find("\r\n\r\n", 1, true)
+    if start_of_header then break end
+  end
+  if idx == #ibuf and not start_of_header then return end
+  local message = table.concat(ibuf, 1, idx)
+  local chunks = { }
+  for idx = idx + 1, #ibuf do
+    table.insert(chunks, ibuf[idx])
+  end
+  socket.ibuf = chunks
+  
   local primary_line = message:find("\r\n")
   local method_end = message:find(" ")
   local path_end = message:find(" ", method_end + 1)
-  local method = messge:sub(1, method_end - 1)
+  local method = message:sub(1, method_end - 1)
   local path = message:sub(method_end + 1, path_end - 1)
-  local version = message:sub(path_end + 1)
+  local version = message:sub(path_end + 1, primary_line - 1)
   local offset = primary_line + 1
   while offset < start_of_header do
     local s,e = message:find(":%s*", offset)
-    headers[message:sub(offset, s - 1):lower()] = message:sub(offset, e + 1)
-    offset = message:find("\r\n", e + 1) + 1
+    local key = message:sub(offset + 1, s - 1):lower()
+    offset  = message:find("\r\n", e + 1) + 1
+    headers[key] = message:sub(e + 1, offset - 1)
   end
   return version, method, path, headers, message:sub(end_of_header+1)
 end
 
 function Request.write(socket, method, path, headers)
-  socket:write(method .. " " .. path .. " HTTP/1.1")
-  for k,v in ipairs(headers) do socket:write(k .. ": " .. v .. "\r\n") end
-  socket:write("\r\n")
+  local chunk = method .. " " .. path .. " HTTP/1.1\r\n"
+  for k,v in pairs(headers or {}) do chunk = chunk .. (k .. ": " .. v .. "\r\n") end
+  chunk = chunk .. "\r\n"
+  table.insert(socket.obuf, chunk)
 end
 
 function Response.write(socket, code, headers)
-  socket:write("HTTP/1.1 " .. code .. " " .. codes[code] .. "\r\n")
-  for k,v in ipairs(headers) do socket:write(k .. ": " .. v .. "\r\n") end
-  socket:write("\r\n")
+  local chunk = "HTTP/1.1 " .. code .. " " .. codes[code] .. "\r\n"
+  for k,v in pairs(headers or { ["Content-Length"] = 0 }) do chunk = chunk .. (k .. ": " .. v .. "\r\n") end
+  chunk = chunk .."\r\n"
+  socket.request.responded = true
+  table.insert(socket.obuf, chunk)
 end
 
 
@@ -96,6 +122,7 @@ function Server.new(options) return setmetatable({ hosts = {}, options = options
 function Host.new(server, host, options) return setmetatable({ server = server, locations = {}, host = host, options = options }, Host) end
 function Location.new(host, path, options) 
   local self = setmetatable({ host = host, path = path, options = options }, Location) 
+  if not self.options.headers then self.options.headers = {} end
   if options.gnu then self.options.headers["X-Clacks-Overhead"] = "GNU Terry Pratchett" end
   if options.redirect then self.options.headers["Location"] = options.location self.options.code = 302 end
   if options.get or options.post or options.put or options.delete then 
@@ -109,58 +136,115 @@ function Location.new(host, path, options)
 end
 
 
-function Location:init(socket, method, path, headers)
-  if self.options.static then
-    local anchor = type(options.static) == "string" and options.static or "."
+function Socket:flush()
+  if #self.obuf > 0 then
+    local sent = self:send(self.obuf[1], self.ooff)
+    if sent < #self.obuf[1] - self.ooff then
+      self.ooff = sent + self.ooff
+    else
+      if #self.obuf > 1 then
+        local buffer = table.concat(self.obuf, '', 2)
+        sent = self:send(buffer, 0)
+        self.obuf = sent == #buffer and {} or { buffer }
+        self.ooff = #buffer - sent
+      else
+        self.obuf, self.ooff = {}, 0
+      end
+    end
+  end
+  return #self.obuf == 0
+end
+
+local mime_types = {
+  aac = "audio/aac", abw = "application/x-abiword", arc = "application/x-freearc", avif = "image/avif", avi = "application/vnd.amazon.ebook", bin = "application/octet-stream", bmp = "image/bmp", bz = "application/x-bzip", bz2 = "application/x-bzip2", cda = "application/x-cdf", 
+  csh = "application/x-csh", css = "text/css", csv = "text/csv", doc = "application/msword", docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document", eot = "application/vnd.ms-fontobject", epub  = "application/epub+zip", gz = "application/gzip", gif = "image/gif",
+  htm = "text/html", html = "text/html", ico = "image/vnd.microsoft.icon", ics = "text/calendar", jar = "application/java-archive", jpeg = "image/jpeg", jpg = "image/jpeg", js = "text/javascript", json = "application/json", jsonld = "application/ld+json", mid = "audio/midi",
+  mjs = "text/javascript", mp3 = "audio/mpeg", mp4 = "video/mp4", mpeg = "video/mpeg", mpkg = "application/vnd.apple.installer+xml", odp = "application/vnd.oasis.opendocument.presentation", ods = "application/vnd.oasis.opendocument.spreadsheet", odt = "application/vnd.oasis.opendocument.text",
+  oga = "audio/ogg", ogv = "video/ogg", ogx = "application/ogg", opus = "audio/opus", otf = "font/otf", png = "image/png", pdf = "application/pdf", php = "application/x-httpd-php", ppt = "application/vnd.ms-powerpoint", pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  rar = "application/vnd.rar", rtf = "application/rtf", sh = "application/x-sh", svg = "image/svg+xml", tar = "application/x-tar", tif = ".tiff	image/tiff", ts = "video/mp2t", ttf = "font/ttf", txt = "text/plain", vsd = "application/vnd.visio", wav = "audio/wav", weba = "audio/webm", webm = "video/webm",
+  webp = "image/webp", woff = "font/woff", woff2 = "font/woff2", xhtml = "application/xhtml+xml", xls = "application/vnd.ms-excel", xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xml = "application/xml", xul = "application/vnd.mozilla.xul+xml", zip = "application/zip",
+  ["3gp"] = "video/3gpp", ["3g2"] = "video/3gpp2", ["7z"] = "application/x-7z-compressed"
+}
+
+local function get_mime_type(path)
+  local _, _, extension = path:find("%.(%w+)$")
+  return (extension and mime_types[extension]) or "application/octet-stream"
+end
+
+function Request.init(location, socket, method, path, headers) -- Originally called when we've received all of the header.
+  local response_headers = common.merge(location.options.headers)
+  if location.options.date then response_headers["Date"] = os.date("%a, %d %b %Y %H:%M:%S %Z") end
+  if location.options.static then
+    if method ~= "GET" then error({ 405 }) end
+    local anchor = type(location.options.static) == "string" and location.options.static or "."
     local stat = system.stat(anchor)
     local target = stat.type == "dir" and (anchor .. PATHSEP .. truncated)  or anchor
     local fh = io.open(target, "rb")
     if not fh then error({ 404 }) end
     socket.static = { stat = stat, fh = fh }
-    Response.write(socket, 200, common.merge(options.headers, { ["Content-Length"] = stat.size, ["Content-Type"] = getMimeType(target) }))
-  elseif self.options.forward then
+    response_headers["Content-Length"] = stat.size
+    response_headers["Content-Type"] = get_mime_type(target)
+    Response.write(socket, 200, response_headers)
+  elseif location.options.forward then
     local _, _, protocol, host, port = options.forward:find("^(%w+)://([^:]+):?(%d+)$")
     socket.forward = { client = Socket.connect(protocol, host, port), length = headers["Content-Length"] } -- this is blocking for now, may want to change this in future.
     Request.write(socket.forward.client, code, headers)
-  elseif self.options.callback then
-    self.options.callback(socket, method, path, headers)
+  elseif location.options.callback then
+    location.options.callback(socket, method, path, headers)
   else
-    local code = options.code or (options.body and 200 or 204)
-    local headers = options.body and common.merge(options.headers, { ["Content-Length"] = #options.body }) or options.headers
-    Response.writeHeaders(socket, code, headers)
+    local code = location.options.code or (location.options.body and 200 or 204)
+    response_headers["Content-Length"] = location.options.body and #location.options.body or 0
+    Response.write(socket, code, response_headers)
+    table.insert(socket.obuf, location.options.body)
   end
+  return { location = location, method = method, path = path, headers = headers }
 end
 
-
-function Location:cont(socket, method, path, headers, body)
-  if socket.static then
-    local chunk = socket.static.fh:read(LOCAL_IO_CHUNK_SIZE)
-    if not chunk then socket.static = nil return false end
-    socket:write(chunk)
-    return true
+function Request.on_read(socket) -- Called when we have an incoming chunk for the same request.
+  if socket.callback then
+    return socket.callback(socket)
   end
   if socket.forward then
-    local chunk = body
-    if socket.forward.length then 
-      chunk = socket:read(math.min(socket.forward.length, FORWARD_CHUNK_SIZE))
-      socket.forward.length = socket.forward.length - #chunk
-    else
-      chunk = socket:read(FORWARD_CHUNK_SIZE)
-      if not chunk then socket.forward.client:close() socket.forward = nil return false end
+    if socket.ioff then
+      local chunk = socket.ibuf[1]:sub(socket.ioff)
+      table.insert(socket.forward.obuf, chunk)
     end
-    socket.forward.client:write(chunk)
-    return true
-  end
-  if socket.callback then
-    return socket.callback(socket, method, path, headers, body)
-  end
-  if socket.manual then
-    if options.body then socket:write(options.body) end
+    for i = 2, #socket.ibuf do
+      table.insert(socket.forward.obuf, socket.ibuf[i])
+    end
+    socket.ibuf = {}
+    socket.forward:flush()
     return false
   end
+  socket.ibuf, socket.ioff = {}, 0
+  return true
+end
+
+function Request.on_write(socket) -- Called when we can write outgoing.
+  if socket.static then
+    local chunk = socket.static.fh:read(LOCAL_IO_CHUNK_SIZE)
+    if not chunk then socket.static = nil return true end
+    table.insert(socket.obuf, chunk)
+    return false
+  end
+  if socket.forward then
+    for i, buf in ipairs(socket.forward.ibuf) do table.insert(socket.obuf, buf) end
+    return true
+  end
+  return true
 end
 
 
+function Request.on_done(socket) -- Called when we've received all the chunks we're going to receive from the client for this request.
+  socket:flush()
+  socket.request.complete = true
+end
+
+
+function Response.done(socket)
+  if socket.close_after_write then socket:close() end
+  socket.request = nil
+end
 
 local servers = {}
 
@@ -179,9 +263,10 @@ xpcall(function()
     header = "list", body = "string", callback = "string", error = "string", 
     stdout = "string", stderr = "string", compress = "string", inherit = "string",
     redirect = "string", verbose = "flag", version = "flag", help = "flag", plugin = "string",
-    host = "string", gnu = "flag", get = "flag", post = "flag", put = "flag", delete = "flag"
+    host = "string", gnu = "flag", get = "flag", post = "flag", put = "flag", delete = "flag",
+    server = "string", location = "string", host = "string", date = "flag"
   }
-  local ARGS = common.args(ARGV, options, 1, server_idx)
+  local ARGS = common.args(ARGV, options, 1, server_idx - 1)
   if ARGS["version"] then print(VERSION) return 0 end
   if ARGS["help"] then
     io.stderr:write([[
@@ -264,7 +349,7 @@ Location Flags
   with a % (%q). These can be escaped with backslash.
 
   --static=path       Statically serves content located at the path, if
-                      the path specified is a directory. If it's a file
+0                      the path specified is a directory. If it's a file
                       serves that file.
   --forward=host:port Forwards the HTTP request onto the specified location.
   --timeout=60        Sets the timeout for activity on this location.
@@ -293,6 +378,7 @@ Location Flags
   --redirect=url      A quick way of specying a 302. 
   --verbose           Dumps requests and responses to STDOUT.
   --gnu               Adds 'X-Clacks-Overhead: GNU Terry Pratchett' header.
+  --date              Adds thes 'Date' header to the response.
   --[get|post|...]    Limits interactions to only these methods.
   
 ]]
@@ -302,36 +388,39 @@ Location Flags
   if not server_idx then error("can't find --server specifier") end
   while server_idx do
     local server, host_idx, next_host_idx, server_options
-    local next_server_idx = common.find(ARGS, "server", server_idx)
+    local next_server_idx = common.find(ARGV, "server", server_idx + 1)
     repeat
-      local host, location_idx, next_location_idx, host_options
-      local next_host_idx = common.find(ARGS, "host", host_idx or server_idx)
+      local host, next_location_idx, host_options
+      local next_host_idx = common.find(ARGV, "host", (host_idx or server_idx) + 1, next_server_idx)
+      local location_idx = common.find(ARGV, "location", (host_idx or server_idx) + 1, (next_host_idx or next_server_idx))
+      local host_options = common.merge(server_options, common.args(ARGV, options, host_idx or server_idx, (location_idx or next_host_idx or next_server_idx or (#ARGV+1)) - 1 ))
       repeat
-        next_location_idx = common.find(ARGS, "location", location_idx or host_idx or server_idx)
+        next_location_idx = common.find(ARGV, "location", (location_idx or host_idx or server_idx) + 1, next_host_idx or next_server_idx)
         server_options = server_options or common.merge(ARGS, common.args(ARGV, options, server_idx, host_idx or next_server_idx))
-        host_options = host_options or common.merge(server_options, common.args(ARGV, options, host_idx, location_idx or next_host_idx or next_server_idx))
-        location_options = common.merge(host_options, common.args(ARGV, options, host_idx, location_idx or next_host_idx or next_server_idx))
+        local location_options = common.merge(host_options, common.args(ARGV, options, location_idx or host_idx or server_idx, (next_location_idx or next_host_idx or next_server_idx or (#ARGV+1)) - 1))
         server = server or Server.new(server_options)
-        host = host or Host.new(server, host_options.host, host_options)
-        table.insert(host.locations, Location.new(host, host_options.location, host_options))
+        host = host or Host.new(server, host_options.host or ".", host_options)
+        table.insert(host.locations, Location.new(host, location_options.location or "/", location_options))
         location_idx = next_location_idx
-      until location_idx and location_idx < (host_idx or server_idx)
+      until not location_idx
       host_idx = next_host_idx
       table.insert(server.hosts, host)
-    until host_idx and host_idx < server_idx
+    until not host_idx or host_idx > server_idx
     server_idx = next_server_idx
     table.insert(servers, server)
   end
   local ss = SocketSet.new()
-  local sockets = {}
+  local sockets, address, port = {}
   for i, server in ipairs(servers) do
-    local _, _, address, port = server.options.server:find("([^:]+):?(%d+)")
+    port = select(3, server.options.server:find("^(%d+)$"))
+    if not port then address, port = select(3, server.options.server:find("([^:]+):?(%d+)")) else address = "0.0.0.0" end
+    if not address then error("can't parse server address " .. server.options.server) end
     local ssl = nil
     if server.options.ssl_key or server.options.ssl_cert then
       if not server.options.ssl_key then error("must supply an ssl_key alongside an ssl_cert") end
       if not server.options.ssl_cert then error("must supply an ssl_cert alongside an ssl_key") end
       ssl = { server.options.ssl_cert, server.options.ssl_key }
-    elseif sever.options.ssl_callback then
+    elseif server.options.ssl_callback then
       ssl = parse_function_or_path(sever.options.ssl_callback)
     end
     local socket = ss:add(Socket.listen(address, port, { ssl = ssl }))
@@ -340,11 +429,11 @@ Location Flags
 
   local clients = {}
   local last_active_check = os.time()
-  
-  while true do
-    local socket = ss:poll(10)
-    local time = os.time()
 
+  log("Spinning up server...")
+  while true do
+    local socket, event = ss:poll(10)
+    local time = os.time()
     if time - last_active_check > 10 then
       local connections = {}
       for i,v in ipairs(clients) do 
@@ -358,39 +447,87 @@ Location Flags
       last_active_check = time
       clients = connections
     end
-
+    
     if socket then
       local server, client = socket.server
-      if server then client = ss:add(socket:accept()) client.message = "" else client = socket end
+      if not socket.ibuf then 
+        client = ss:add(socket:accept()) 
+        client.ibuf, client.obuf, client.ioff, client.ooff, client.server = {}, {}, 0, 0, server
+      else 
+        client = socket 
+      end
       client.activity = time
-
-      if not client.ongoing then
-        client.message = client.message .. client.message:recv(HEADER_CHUNK_SIZE)
-        if server.options.verbose then io.stdout:write(client.message) end
-        local version, method, path, headers, body = Request.parse(client.message)
-        if version then
-          local host = headers["host"]
-          for i, h in ipairs(server.hosts) do
-            if h.host:find(host) then
-              for j, l in ipairs(h.locatoions) do
-                local s,e = l.path:find("^" .. path)
-                if s then
-                  path = path:sub(e + 1)
-                  client.ongoing = { location = l, host = host, method = method, path = path, headers = headers }
-                  l:init(client, method, path, headers)
-                  if body then l:cont(client, method, path, headers, body) end
-                  break
+      local status, err = pcall(function()
+        if event & CAN_READ then
+          local chunk = client:recv(HEADER_CHUNK_SIZE)
+          if #chunk > 0 then
+            table.insert(client.ibuf, chunk)
+            if not client.request then -- If we don't have an ongoing request.
+              local version, method, path, headers, body, index, offset = Request.parse(client)
+              if version then
+                if index then 
+                  client.ioff = offset
+                  local buf = { } 
+                  table.setn(buf, #client.ibuf - index)
+                  for i = index, #client.ibuf do buf[i - index + 1] = client.ibuf[i] end
                 end
+                client.request = { responded = false }
+                local host = headers["host"]
+                for i, h in ipairs(server.hosts) do
+                  if host:find(h.host) then
+                    client.host = h
+                    for j, l in ipairs(h.locations) do
+                      if path:find("^" .. l.path) then
+                        client.request = Request.init(l, client, method, path, headers)
+                        log("Request " .. method .. " " .. path)
+                        if #client.ibuf then Request.on_read(client) end
+                        if method == "GET" then Request.on_done(client) end
+                        event = event | CAN_WRITE
+                        break
+                      end
+                    end
+                  end
+                end
+                if client.request and not client.request.location then
+                  log("Request " .. method .. " " .. path)
+                  error({ 404 })
+                end
+              else
+                local length = 0 for i = 1, #client.ibuf do length = length + #client.ibuf[i] end
+                if length >= MAX_HEADER_SIZE then error({ 431 }) end
+              end
+            else
+              if Request.on_read(client) then
+                if client.location and not client.location.settings.keep_alive then client.close_after_write = true end
               end
             end
           end
         end
-      else
-        local ongoing = client.ongoing
-        local location = ongoing.location
-        if location:cont(client, ongoing.method, ongoing.path, ongoing.headers) then
-          if not location.keep_alive then client:close() end
-          client.activity = os.time()
+        if client.request and client.request.location and (event & CAN_WRITE) then
+          local finished, fully_flushed
+          repeat 
+            finished = Request.on_write(client)
+            fully_flushed = client:flush()
+          until not fully_flushed or finished
+          if fully_flushed and finished then
+            Response.done(client)
+          end
+        end
+      end)
+      if not status then
+        if client and type(err) == "table" then
+          if client.request and not client.request.responded then
+            Response.write(client, table.unpack(err))
+            Response.done(client)
+            client:flush()
+          else
+            client:close()
+          end
+        elseif client then
+          log(err)
+          client:close()
+        else
+          error(err)
         end
       end
     end

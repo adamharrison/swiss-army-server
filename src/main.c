@@ -23,7 +23,7 @@
 #endif
 
 
-#define MAX_EVENTS 1
+#define MAX_EVENTS 10
 #define MAX_RECV_BUFFER (16*1024)
 
 struct SocketSet {
@@ -35,41 +35,48 @@ struct SocketSet {
 static int socketset_new(lua_State *L) {
   lua_newtable(L);
   struct SocketSet* s = lua_newuserdata(L, sizeof(struct SocketSet));
-  lua_setfield(L, -1, "set");
+  lua_setfield(L, -2, "set");
   s->epollfd = epoll_create1(0);
   if (s->epollfd == -1)
     return luaL_error(L, "can't create epoll: %s", strerror(errno));
-  luaL_setmetatable(L, "socketset");
+  luaL_setmetatable(L, "SocketSet");
   return 1;
 }
 
+
 static int socketset_add(lua_State* L) {
   struct epoll_event ev;
-  ev.events = EPOLLIN;
-  luaL_checktype(L, 1, LUA_TTABLE);
-  lua_getfield(L, 1, "socket");
+  ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+  luaL_checktype(L, 2, LUA_TTABLE);
+  lua_getfield(L, 2, "socket");
   ev.data.fd = luaL_checkinteger(L, -1);
   lua_pop(L, 1);
   lua_getfield(L, 1, "set");
   struct SocketSet* s = lua_touserdata(L, -1);
   if (epoll_ctl(s->epollfd, EPOLL_CTL_ADD, ev.data.fd, &ev) == -1)
     return luaL_error(L, "can't add socket %d: %s", ev.data.fd, strerror(errno));
+  lua_pop(L, 1);
+  lua_pushinteger(L, ev.data.fd);
+  lua_pushvalue(L ,-2);
+  lua_rawset(L, 1);
   return 1;
 }
 
  
 static int socketset_poll(lua_State* L) {
-  int timeout = luaL_checkinteger(L, 2);
+  double timeout = luaL_checknumber(L, 2);
   lua_getfield(L, 1, "set");
   struct SocketSet* s = lua_touserdata(L, -1);
-  while (1) {
-    int nfds = epoll_wait(s->epollfd, s->events, MAX_EVENTS, timeout);
-    if (nfds == -1) 
-      return luaL_error(L, "can't poll: %s", strerror(errno));
-    lua_pushinteger(L, s->events[0].data.fd);
-    lua_rawget(L, 1);
-    return 1;
-  }
+  int nfds = epoll_wait(s->epollfd, s->events, MAX_EVENTS, (int)(timeout * 1000.0));
+  if (nfds == -1) 
+    return luaL_error(L, "can't poll: %s", strerror(errno));
+  if (nfds == 0)
+    return 0;
+  lua_pop(L, 1);
+  lua_pushinteger(L, s->events[0].data.fd);
+  lua_rawget(L, 1);
+  lua_pushinteger(L, ((s->events[0].events & EPOLLIN) ? 1 : 0) | ((s->events[0].events & EPOLLOUT) ? 2 : 0));
+  return 2;
 }
 
 
@@ -83,21 +90,22 @@ static int socketset_close(lua_State* L) {
 
 #ifndef SAS_NO_SSL
 static int ssl_callback(SSL *ssl, int *al, void *L) {
-    lua_getfield(L, LUA_REGISTRYINDEX, "ssl_backreference");
-    lua_pushlightuserdata(L, SSL_get_SSL_CTX(ssl));
-    lua_rawget(L, -2);
-    lua_getfield(L, -1, "cb");
-    lua_pushstring(L, SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name));
-    lua_call(L, 1, 2);
-    const char* certificate = luaL_checkstring(L, -2);
-    const char* private_key = luaL_checkstring(L, -1);
-    if (!lua_isstring(L, -2) || SSL_CTX_use_certificate_file(SSL_get_SSL_CTX(ssl), lua_tostring(L, -1), SSL_FILETYPE_PEM) <= 0) 
-      return SSL_TLSEXT_ERR_ALERT_FATAL;
-    if (!lua_isstring(L, -1) || SSL_CTX_use_PrivateKey_file(SSL_get_SSL_CTX(ssl), lua_tostring(L, -1), SSL_FILETYPE_PEM) <= 0 )
-      return SSL_TLSEXT_ERR_ALERT_FATAL;
-    return SSL_TLSEXT_ERR_OK;
+  lua_getfield(L, LUA_REGISTRYINDEX, "ssl_backreference");
+  lua_pushlightuserdata(L, SSL_get_SSL_CTX(ssl));
+  lua_rawget(L, -2);
+  lua_getfield(L, -1, "cb");
+  lua_pushstring(L, SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name));
+  lua_call(L, 1, 2);
+  const char* certificate = luaL_checkstring(L, -2);
+  const char* private_key = luaL_checkstring(L, -1);
+  if (!lua_isstring(L, -2) || SSL_CTX_use_certificate_file(SSL_get_SSL_CTX(ssl), lua_tostring(L, -1), SSL_FILETYPE_PEM) <= 0) 
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+  if (!lua_isstring(L, -1) || SSL_CTX_use_PrivateKey_file(SSL_get_SSL_CTX(ssl), lua_tostring(L, -1), SSL_FILETYPE_PEM) <= 0 )
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+  return SSL_TLSEXT_ERR_OK;
 }
 #endif 
+
 
 static int socket_listen(lua_State* L) {
   lua_newtable(L);
@@ -105,7 +113,8 @@ static int socket_listen(lua_State* L) {
   addr.sin_addr.s_addr = inet_addr(luaL_checkstring(L, 1));
   addr.sin_port = htons(luaL_checkinteger(L, 2));
   int s = socket(AF_INET, SOCK_STREAM, 0);
-  if (s < 0)
+  int flag = 1;
+  if (s < 0 || setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag)))
     luaL_error(L, "can't open socket: %s", strerror(errno));
   if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
     close(s);
@@ -160,7 +169,7 @@ static int socket_listen(lua_State* L) {
     lua_pop(L, 1);
   }
   #endif 
-  luaL_setmetatable(L, "socket");
+  luaL_setmetatable(L, "Socket");
   return 1;
 }
 
@@ -187,7 +196,7 @@ static int socket_connect(lua_State* L) {
   lua_setfield(L, -2, "socket");
   lua_pushboolean(L, 1);
   lua_setfield(L, 1, "ctx");
-  luaL_setmetatable(L, "socket");
+  luaL_setmetatable(L, "Socket");
   return 1;
 }
 
@@ -225,7 +234,7 @@ static int socket_accept(lua_State* L) {
   lua_newtable(L);
   lua_pushinteger(L, client);
   lua_setfield(L, -2, "socket");
-  luaL_setmetatable(L, "socket");
+  luaL_setmetatable(L, "Socket");
   lua_getfield(L, 1, "ctx");
   #ifndef SAS_NO_SSL
   if (!lua_isnil(L, -1)) {
@@ -248,11 +257,13 @@ static int socket_accept(lua_State* L) {
 static int socket_send(lua_State* L) {
   size_t len;
   const char* msg = luaL_checklstring(L, 2, &len);
+  size_t offset = luaL_optinteger(L, 3, 0);
   lua_getfield(L, 1, "socket");
+  int s = lua_tointeger(L, -1);
   lua_getfield(L, 1, "ssl");
-  int s, written = lua_tointeger(L, 1);
+  int written;
   if (lua_isnil(L, -1)) {
-    written = send(s, msg, len, 0);
+    written = send(s, &msg[offset], len - offset, 0);
     if (written < 0) {
       if (errno != EAGAIN && errno != EWOULDBLOCK)
         return luaL_error(L, "can't send to socket: %s", strerror(errno));
@@ -261,7 +272,7 @@ static int socket_send(lua_State* L) {
   } else {
     #ifndef SAS_NO_SSL
     SSL* ssl = lua_touserdata(L, -1);
-    written = SSL_write(ssl, msg, len);
+    written = SSL_write(ssl, &msg[offset], len - offset);
     if (written < 0) {
       if (SSL_get_error(ssl, len) != SSL_ERROR_WANT_WRITE)
         return luaL_error(L, "can't send to ssl socket: %d", SSL_get_error(ssl, written));
@@ -395,14 +406,19 @@ static const luaL_Reg system_lib[] = {
   #define SAS_VERSION "unknown"
 #endif
 
+static int f_sleep(lua_State* L) {
+  sleep(luaL_checkinteger(L, 1));
+}
+
 
 extern const char src_main_lua[];
 extern unsigned int src_main_lua_len;
 int main(int argc, char* argv[]) {
   lua_State* L = luaL_newstate();
   luaL_openlibs(L);
-  luaL_newmetatable(L, "socketset"); luaL_setfuncs(L, socketset_lib, 0); lua_setglobal(L, "socketset");
-  luaL_newmetatable(L, "socket"); luaL_setfuncs(L, socket_lib, 0); lua_setglobal(L, "socket");
+  luaL_newmetatable(L, "SocketSet"); luaL_setfuncs(L, socketset_lib, 0); lua_pushvalue(L, -1); lua_setfield(L, -2, "__index"); lua_setglobal(L, "SocketSet");
+  luaL_newmetatable(L, "Socket"); luaL_setfuncs(L, socket_lib, 0); lua_pushvalue(L, -1); lua_setfield(L, -2, "__index"); lua_setglobal(L, "Socket");
+  lua_pushcfunction(L, f_sleep); lua_setglobal(L, "sleep");
   luaL_newlib(L, system_lib); lua_setglobal(L, "system");
   lua_newtable(L);
   for (int i = 0; i < argc; ++i) {
@@ -437,4 +453,3 @@ int main(int argc, char* argv[]) {
   lua_close(L);
   return status;
 }
-                                                                     
