@@ -1,9 +1,6 @@
 [submodule "lib/lua"]
 	path = lib/lua
 	url = https://github.com/lua/lua.git
-[submodule "lib/openssl"]
-	path = lib/openssl
-	url = https://github.com/openssl/openssl.git
 [submodule "lib/zlib"]
 	path = lib/zlib
 	url = https://github.com/madler/zlib.git
