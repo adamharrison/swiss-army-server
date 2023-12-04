@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <math.h>
+#include <pthread.h>
 
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509.h>
@@ -28,8 +29,6 @@
 
 
 #define MAX_EVENTS 10
-#define READ_BUFFER_SIZE 4096
-#define WRITE_BUFFER_SIZE 4096
 
 struct Pending {
   int epollfd;
@@ -44,20 +43,59 @@ enum ESocketType {
   SOCKET_TYPE_PIPE     = 0x04,
   SOCKET_TYPE_MASK     = 0x07,
   SOCKET_HAS_SSL       = 0x08,
-  SOCKET_HAS_CALLBACK  = 0x10,
-  SOCKET_HAS_FORWARD   = 0x20
+  SOCKET_HAS_CALLBACK  = 0x10
 };
 
 struct Socket {
   int type;
-  int fds[2];                 // Bidirectional pipe for SOCKET_TYPE_PIPE, otherwise, signle fd.
-  time_t last_activity;       // time
-  struct Socket* forward;
-  int incoming_buffer_length;
-  int outgoing_buffer_length;
-  char buffer[];
+  int fds[2];                       // Bidirectional pipe for SOCKET_TYPE_PIPE, otherwise, signle fd.
+  time_t last_activity;             // time
 };
 
+struct SSLSocket {
+  struct Socket socket;
+  char peer[128];
+  mbedtls_ssl_config config;
+  mbedtls_ssl_context ssl_context;
+  mbedtls_net_context net_context;
+  int handshook;
+  mbedtls_x509_crt certificate; // The SSL certificate for this client.
+  mbedtls_pk_context private_key; // The SSL private_key for this client.
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context ctr_drbg;
+};
+
+static struct Socket* lua_newsocket(lua_State* L, int type) {
+  int size = ((type & SOCKET_HAS_SSL) != 0) ? sizeof(struct SSLSocket) : sizeof(struct Socket);
+  struct Socket* socket = lua_newuserdata(L, size);
+  memset(socket, 0, size);
+  socket->type = type;
+  luaL_setmetatable(L, "Socket");
+  return socket;
+}
+
+static int lua_mbedtls_error(lua_State* L, int code, const char* str, ...) {
+  char vsnbuffer[1024];
+  char mbed_buffer[128];
+  mbedtls_strerror(code, mbed_buffer, sizeof(mbed_buffer));
+  va_list va;
+  va_start(va, str);
+      vsnprintf(vsnbuffer, sizeof(vsnbuffer), str, va);
+  va_end(va);
+  lua_pushfstring(L, "%s: %s", vsnbuffer, mbed_buffer);
+  return code;
+}
+
+static int luaL_mbedtls_error(lua_State* L, int code, const char* str, ...) {
+  char vsnbuffer[1024];
+  char mbed_buffer[128];
+  mbedtls_strerror(code, mbed_buffer, sizeof(mbed_buffer));
+  va_list va;
+  va_start(va, str);
+      vsnprintf(vsnbuffer, sizeof(vsnbuffer), str, va);
+  va_end(va);
+  return luaL_error(L, "%s: %s", vsnbuffer, mbed_buffer);
+}
 
 static int f_pending_new(lua_State *L) {
   lua_newtable(L);
@@ -149,31 +187,50 @@ static int f_pending_close(lua_State* L) {
 }
 
 static int f_socket_listen(lua_State* L) {
-  struct sockaddr_in addr = { .sin_family = AF_INET };
-  addr.sin_addr.s_addr = inet_addr(luaL_checkstring(L, 1));
-  addr.sin_port = htons(luaL_checkinteger(L, 2));
-  int s = socket(AF_INET, SOCK_STREAM, 0);
-  int flag = 1;
-  if (s < 0)
-    return luaL_error(L, "can't open socket: %s", strerror(errno));
-  if (setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag)) || bind(s, (struct sockaddr*)&addr, sizeof(addr)) < 0 || listen(s, 1) < 0) {
-    close(s);
-    return luaL_error(L, "can't listen on socket: %s", strerror(errno));
+  int ssl = lua_toboolean(L, 3);
+  if (ssl) {
+    struct SSLSocket* server = (struct SSLSocket*)lua_newsocket(L, SOCKET_TYPE_SERVER | SOCKET_HAS_SSL);
+    mbedtls_ssl_config_init(&server->config);
+    mbedtls_ssl_init(&server->ssl_context);
+    mbedtls_net_init(&server->net_context);
+    char port[64];
+    snprintf(port, sizeof(port), "%lld", luaL_checkinteger(L, 2));
+    mbedtls_net_bind(&server->net_context, luaL_checkstring(L, 1), port, MBEDTLS_NET_PROTO_TCP);
+    server->socket.fds[0] = server->net_context.fd;
+    int ret = mbedtls_ssl_config_defaults(&server->config, MBEDTLS_SSL_IS_SERVER, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret < 0)
+      return luaL_mbedtls_error(L, ret, "can't set defaults");
+  } else {
+    struct Socket* server = lua_newsocket(L, SOCKET_TYPE_SERVER);
+    struct sockaddr_in addr = { .sin_family = AF_INET };
+    addr.sin_addr.s_addr = inet_addr(luaL_checkstring(L, 1));
+    addr.sin_port = htons(luaL_checkinteger(L, 2));
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int flag = 1;
+    if (s < 0)
+      return luaL_error(L, "can't open socket: %s", strerror(errno));
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag)) || bind(s, (struct sockaddr*)&addr, sizeof(addr)) < 0 || listen(s, 1) < 0) {
+      close(s);
+      return luaL_error(L, "can't listen on socket: %s", strerror(errno));
+    }
+    server->fds[0] = s;
   }
-  struct Socket* socket = lua_newuserdata(L, sizeof(struct Socket));
-  socket->type = SOCKET_TYPE_SERVER;
-  socket->fds[0] = s;
-  luaL_setmetatable(L, "Socket");
   return 1;
 }
 
 static int f_socket_peer(lua_State* L) {
   struct Socket* self = lua_touserdata(L, 1);
-  struct sockaddr_in client_addr = {0};
-  int addr_len = sizeof(client_addr);
-  if (getpeername(self->fds[0], (struct sockaddr*)&client_addr, &addr_len) < 0)
-    return luaL_error(L, "unable to get peer address: %s", strerror(errno));
-  lua_pushstring(L, inet_ntoa(client_addr.sin_addr));
+  if (!(self->type & SOCKET_TYPE_CLIENT))
+    return 0;
+  if (self->type & SOCKET_HAS_SSL) {
+    lua_pushstring(L, ((struct SSLSocket*)self)->peer);
+  } else {
+    struct sockaddr_in client_addr = {0};
+    int addr_len = sizeof(client_addr);
+    if (getpeername(self->fds[0], (struct sockaddr*)&client_addr, &addr_len) < 0)
+      return luaL_error(L, "unable to get peer address: %s", strerror(errno));
+    lua_pushstring(L, inet_ntoa(client_addr.sin_addr));
+  }
   return 1;
 }
 
@@ -186,29 +243,25 @@ static int f_socket_connect(lua_State* L) {
   if (!host)
     return luaL_error(L, "can't resolve hostname %s", hostname);
   int s = socket(AF_INET, SOCK_STREAM, 0);
+  fcntl(s, F_SETFL, O_NONBLOCK);
   dest_addr.sin_family = AF_INET;
   dest_addr.sin_port = htons(port);
   dest_addr.sin_addr.s_addr = *(long*)(host->h_addr);
-  const char* ip = inet_ntoa(dest_addr.sin_addr);
-  if (connect(s, (struct sockaddr *) &dest_addr, sizeof(struct sockaddr)) == -1 ) {
-    close(s);
-    return luaL_error(L, "can't connect to host %s [%s] on port %d", hostname, ip, port);
+  if (connect(s, (struct sockaddr *) &dest_addr, sizeof(struct sockaddr)) == -1) {
+    if (errno != EINPROGRESS && errno != EAGAIN) {
+      close(s);
+      return luaL_error(L, "can't connect to host %s [%s] on port %d", hostname, inet_ntoa(dest_addr.sin_addr), port);
+    }
   }
-  struct Socket* socket = lua_newuserdata(L, sizeof(struct Socket));
+  struct Socket* socket = lua_newsocket(L, SOCKET_TYPE_CLIENT);
   socket->fds[0] = s;
-  socket->type = SOCKET_TYPE_CLIENT;
-  socket->forward = NULL;
-  socket->outgoing_buffer_length = 0;
-  socket->incoming_buffer_length = 0;
-  luaL_setmetatable(L, "Socket");
   return 1;
 }
 
 
 static int f_socket_pipe(lua_State* L) {
-  struct Socket* socket_a = lua_newuserdata(L, sizeof(struct Socket) + READ_BUFFER_SIZE + WRITE_BUFFER_SIZE);
-  struct Socket* socket_b = lua_newuserdata(L, sizeof(struct Socket) + READ_BUFFER_SIZE + WRITE_BUFFER_SIZE);
-  luaL_getmetatable(L, "Socket");
+  struct Socket* socket_a = lua_newsocket(L, SOCKET_TYPE_PIPE);
+  struct Socket* socket_b = lua_newsocket(L, SOCKET_TYPE_PIPE);
   lua_pushvalue(L, -1);
   lua_setmetatable(L, -3);
   lua_setmetatable(L, -2);
@@ -225,12 +278,6 @@ static int f_socket_pipe(lua_State* L) {
   fcntl(fds[1], F_SETFL, O_NONBLOCK);
   socket_b->fds[0] = fds[0]; // read
   socket_a->fds[1] = fds[1]; // write
-  socket_a->incoming_buffer_length = 0;
-  socket_a->outgoing_buffer_length = 0;
-  socket_b->incoming_buffer_length = 0;
-  socket_a->outgoing_buffer_length = 0;
-  socket_a->type = SOCKET_TYPE_PIPE;
-  socket_b->type = SOCKET_TYPE_PIPE;
   return 2;
 }
 
@@ -242,8 +289,20 @@ static int f_socket_close(lua_State* L) {
     case SOCKET_TYPE_SERVER:
     case SOCKET_TYPE_CLIENT:
     case SOCKET_TYPE_FILE:
-      if (close(self->fds[0]))
-        return luaL_error(L, "can't close socket fd %d: %s", self->fds[0], strerror(errno));
+      if (self->type & SOCKET_HAS_SSL) {
+        struct SSLSocket* ssl = (struct SSLSocket*)self;
+        if (ssl->handshook) {
+          mbedtls_pk_free(&ssl->private_key);
+          mbedtls_x509_crt_free(&ssl->certificate);
+          mbedtls_ctr_drbg_free(&ssl->ctr_drbg);
+          mbedtls_entropy_free(&ssl->entropy);
+        }
+        mbedtls_net_free(&ssl->net_context);
+        mbedtls_ssl_free(&ssl->ssl_context);
+      } else {
+        if (close(self->fds[0]))
+          return luaL_error(L, "can't close socket fd %d: %s", self->fds[0], strerror(errno));
+      }
       self->type = (self->type & ~SOCKET_TYPE_MASK) | SOCKET_TYPE_CLOSED;
     break;
     case SOCKET_TYPE_PIPE:
@@ -254,32 +313,103 @@ static int f_socket_close(lua_State* L) {
   return 0;
 }
 
+static int f_socket_handshake_certificate(void* context, mbedtls_ssl_context* ssl_context, const unsigned char* server_name, size_t server_name_length) {
+  lua_State* L = (lua_State*)context;
+  struct SSLSocket* client = lua_touserdata(L, 1);
+  if (!client->handshook) {
+    lua_pushlstring(L, server_name, server_name_length);
+    if (lua_pcall(L, 1, 3, 0) != 0)
+      return -1;
+    const char* certificate_contents = lua_tostring(L, -3);
+    const char* private_key_contents = lua_tostring(L, -2);
+    const char* chain_contents = lua_tostring(L, -1);
+    if (!certificate_contents || !private_key_contents) {
+      lua_pushfstring(L, "returned no certificate or private key for '%s'", server_name);
+      return -1;
+    }
+    mbedtls_x509_crt_init(&client->certificate);
+    int ret = mbedtls_x509_crt_parse(&client->certificate, certificate_contents, strlen(certificate_contents) + 1);
+    if (ret != 0)
+      return lua_mbedtls_error(L, ret, "error parsing certificate for '%s'", server_name);
+    mbedtls_pk_init(&client->private_key);
+    ret = mbedtls_pk_parse_key(&client->private_key, private_key_contents, strlen(private_key_contents) + 1, NULL, 0, mbedtls_ctr_drbg_random, &client->ctr_drbg);
+    if (ret != 0)
+      return lua_mbedtls_error(L, ret, "error parsing private key for '%s'", server_name);
+    client->handshook = 1;
+  }
+  return mbedtls_ssl_set_hs_own_cert(&client->ssl_context, &client->certificate, &client->private_key);
+}
 
-static int f_socket_accept(lua_State* L) {
-  struct Socket* self = lua_touserdata(L, 1);
-  if (self->type != SOCKET_TYPE_SERVER)
-    return luaL_error(L, "can't accept on socket: not a server");
-  struct sockaddr_in addr;
-  socklen_t addrlen = sizeof(addr);
-  int client_fd = accept(self->fds[0], (struct sockaddr*)&addr, &addrlen);
-  if (client_fd < 0)
-    return luaL_error(L, "can't accept on socket: %s", strerror(errno));
-  fcntl(client_fd, F_SETFL, O_NONBLOCK);
-  struct Socket* client = lua_newuserdata(L, sizeof(struct Socket) + READ_BUFFER_SIZE + WRITE_BUFFER_SIZE);
-  client->fds[0] = client_fd;
-  client->type = SOCKET_TYPE_CLIENT;
-  client->forward = NULL;
-  client->outgoing_buffer_length = 0;
-  client->incoming_buffer_length = 0;
-  luaL_setmetatable(L, "Socket");
+static int f_socket_handshake(lua_State* L) {
+  struct SSLSocket* client = (struct SSLSocket*)lua_touserdata(L, 1);
+  luaL_checktype(L, 2, LUA_TFUNCTION);
+  mbedtls_ssl_conf_sni(&client->config, f_socket_handshake_certificate, L);
+  int top = lua_gettop(L);
+  int ret = mbedtls_ssl_handshake(&client->ssl_context);
+  if (ret != 0) {
+    if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+      if (client->handshook)
+        return luaL_mbedtls_error(L, ret, "error handshaking");
+      return lua_error(L);
+    }
+    return 0;
+  }
+  lua_pushboolean(L, 1);
   return 1;
 }
 
-static int f_socket_flush_write(struct Socket* s) {
-  if (s->outgoing_buffer_length) {
-    return 0;
-  }
+static void my_debug(void *ctx, int level,
+                     const char *file, int line,
+                     const char *str)
+{
+    fprintf(stderr, "WAT\n");
+    fprintf(stderr, "%s:%04d: %s", file, line, str);
+    fflush(stderr);
 }
+
+static int f_socket_accept(lua_State* L) {
+  struct Socket* self = lua_touserdata(L, 1);
+  if ((self->type & SOCKET_TYPE_MASK) != SOCKET_TYPE_SERVER)
+    return luaL_error(L, "can't accept on socket: not a server");
+
+  if (self->type & SOCKET_HAS_SSL) {
+    struct SSLSocket* server = ((struct SSLSocket*)self);
+    struct SSLSocket* client = (struct SSLSocket*)lua_newsocket(L, SOCKET_TYPE_CLIENT | SOCKET_HAS_SSL);
+    mbedtls_net_init(&client->net_context);
+    size_t peer_size;
+    int ret;
+    if ((ret = mbedtls_net_accept(&server->net_context, &client->net_context, client->peer, sizeof(client->peer), &peer_size)) != 0) {
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ)
+        return 0;
+    }
+
+    mbedtls_ctr_drbg_init(&client->ctr_drbg);
+    mbedtls_ssl_init(&client->ssl_context);
+    mbedtls_ssl_config_init(&client->config);
+    mbedtls_ssl_config_defaults(&client->config, MBEDTLS_SSL_IS_SERVER, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    mbedtls_ssl_setup(&client->ssl_context, &client->config);
+    const char *pers = "ssl_server";
+    mbedtls_entropy_init(&client->entropy);
+    ret = mbedtls_ctr_drbg_seed(&client->ctr_drbg, mbedtls_entropy_func, &client->entropy, (const unsigned char *) pers, strlen(pers));
+    mbedtls_ssl_conf_rng(&client->config, mbedtls_ctr_drbg_random, &client->ctr_drbg);
+    mbedtls_ssl_conf_dbg(&client->config, my_debug, stdout);
+    mbedtls_ssl_set_bio(&client->ssl_context, &client->net_context, mbedtls_net_send, mbedtls_net_recv, NULL);
+    mbedtls_net_set_nonblock(&client->net_context);
+  } else {
+    struct Socket* client = lua_newsocket(L, SOCKET_TYPE_CLIENT);
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    client->fds[0] = accept(self->fds[0], (struct sockaddr*)&addr, &addrlen);
+    if (client->fds[0] < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return 0;
+      return luaL_error(L, "can't accept on socket: %s", strerror(errno));
+    }
+    fcntl(client->fds[0], F_SETFL, O_NONBLOCK);
+  }
+  return 1;
+}
+
 
 static int f_socket_write(lua_State* L) {
   struct Socket* client = lua_touserdata(L, 1);
@@ -294,15 +424,27 @@ static int f_socket_write(lua_State* L) {
     case SOCKET_TYPE_PIPE:
       fd = client->fds[1];
     case SOCKET_TYPE_CLIENT:
-      int written = write(fd, &msg[offset], len - offset);
-      if (written < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
-          return luaL_error(L, "can't write to socket: %s", strerror(errno));
-        written = 0;
+      if (client->type & SOCKET_HAS_SSL) {
+        int written = mbedtls_ssl_write(&((struct SSLSocket*)client)->ssl_context, &msg[offset], len - offset);
+        if (written < 0) {
+          if (written != MBEDTLS_ERR_SSL_WANT_WRITE)
+            return luaL_error(L, "can't write to socket: %s", strerror(errno));
+          written = 0;
+        }
+        if (written < len) {
+        }
+        lua_pushinteger(L, written);
+      } else {
+        int written = write(fd, &msg[offset], len - offset);
+        if (written < 0) {
+          if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return luaL_error(L, "can't write to socket: %s", strerror(errno));
+          written = 0;
+        }
+        if (written < len) {
+        }
+        lua_pushinteger(L, written);
       }
-      if (written < len) {
-      }
-      lua_pushinteger(L, written);
     break;
   }
   return 1;
@@ -322,16 +464,28 @@ static int f_socket_read(lua_State* L) {
     int to_receive = len - received;
     if (to_receive > sizeof(chunk))
       to_receive = sizeof(chunk);
-    int chunk_length = read(client->fds[0], chunk, to_receive);
+    int chunk_length;
+    if (client->type & SOCKET_HAS_SSL) {
+      chunk_length = mbedtls_ssl_read(&((struct SSLSocket*)client)->ssl_context, chunk, to_receive);
+      if (chunk_length < 0) {
+        if (chunk_length == MBEDTLS_ERR_SSL_WANT_READ)
+          break;
+        lua_pushnil(L);
+        lua_pushstring(L, strerror(errno));
+        return 1;
+      }
+    } else {
+      chunk_length = read(client->fds[0], chunk, to_receive);
+      if (chunk_length < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+          break;
+        lua_pushnil(L);
+        lua_pushstring(L, strerror(errno));
+        return 1;
+      }
+    }
     if (chunk_length == 0)
       break;
-    if (chunk_length < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        break;
-      lua_pushnil(L);
-      lua_pushstring(L, strerror(errno));
-      return 1;
-    }
     luaL_addlstring(&buffer, chunk, chunk_length);
     received += chunk_length;
   }
@@ -406,16 +560,6 @@ static mbedtls_x509_crt client_x509_certificate;
 static mbedtls_ssl_config client_ssl_config;
 static mbedtls_ssl_context client_ssl_context;
 
-static int luaL_mbedtls_error(lua_State* L, int code, const char* str, ...) {
-  char vsnbuffer[1024];
-  char mbed_buffer[128];
-  mbedtls_strerror(code, mbed_buffer, sizeof(mbed_buffer));
-  va_list va;
-  va_start(va, str);
-      vsnprintf(vsnbuffer, sizeof(vsnbuffer), str, va);
-  va_end(va);
-  return luaL_error(L, "%s: %s", vsnbuffer, mbed_buffer);
-}
 
 static int f_system_certs(lua_State* L) {
   const char* type = luaL_checkstring(L, 1);
@@ -584,6 +728,7 @@ static const luaL_Reg socket_lib[] = {
   { "accept",    f_socket_accept     },   // Non-blocking accept.
   { "write",     f_socket_write      },   // Non-blocking write of N bytes.
   { "read",      f_socket_read       },   // Non-blocking read of N bytes.
+  { "handshake", f_socket_handshake  },   // Non-blocking handshake. Returns true on handsahek completion.
   { NULL,        NULL              }
 };
 

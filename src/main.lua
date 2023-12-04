@@ -1,8 +1,11 @@
+function read(path) return io.open(path, "rb"):read("*all") end
+function filter(l ,f) local t = {} for i,v in ipairs(l) do if f(v) then table.insert(t, v) end end return t end
 setmetatable(_G, { __index = function(t, k) if not rawget(t, k) then error("cannot get undefined global variable: " .. k, 2) end end, __newindex = function(t, k) error("cannot set global variable: " .. k, 2) end  })
 
 local LOCAL_IO_CHUNK_SIZE = 16*4096
 local FORWARD_CHUNK_SIZE = 4096
 local INCREMENTAL_CHUNK_SIZE = 4096
+local MAX_HEADER_SIZE = 8*1024
 local MAX_LINE_SIZE = 4096
 local DEFAULT_TIMEOUT = 60
 local POLL_MAX_TIME = 10
@@ -13,16 +16,18 @@ local function log(m, prefix)
   io.stdout:write(os.date("[%Y-%m-%dT%H:%M:%S]"))
   if prefix then io.stdout:write(prefix) end
   io.stdout:write(" ")
-  io.stdout:write(m)
+  io.stdout:write(tostring(m))
   io.stdout:write("\n")
 end
 
 local CoSocket = {}
 CoSocket.__index = CoSocket
-function CoSocket:flushread()
+function CoSocket:flushread(noflush)
   local ibuf = self.ibuf
-  if self.ibuf ~= '' then self.activity = os.time() end
-  self.ibuf = ''
+  if not noflush then
+    if self.ibuf ~= '' then self.activity = os.time() end
+    self.ibuf = ''
+  end
   return ibuf
 end
 function CoSocket:log(m)
@@ -33,7 +38,7 @@ function CoSocket:log(m)
   end
 end
 -- Read function, reads exactly N amount of bytes, or a line or all.
-function CoSocket:read(toread, nonblocking, throw)
+function CoSocket:read(toread, nonblocking, throw, noflush)
   if not self.ibuf then self.ibuf = '' end
   while true do
     if type(toread) == 'number' then
@@ -43,10 +48,10 @@ function CoSocket:read(toread, nonblocking, throw)
         return ret
       end
       local ret, err = self.socket:read(toread - #self.ibuf)
-      if ret == nil then if throw then error(err) end return self:flushread() end
-      if ret == '' then if nonblocking then return self:flushread() else coroutine.yield(self) end
+      if ret == nil then if throw then error(err) end return self:flushread(noflush) end
+      if ret == '' then if nonblocking then return self:flushread(noflush) else coroutine.yield(self) end
       else self.ibuf = self.ibuf .. ret end
-      return self:flushread()
+      return self:flushread(noflush)
     else
       if toread == "*line" then
         local s,e = self.ibuf:find("\r\n")
@@ -56,39 +61,50 @@ function CoSocket:read(toread, nonblocking, throw)
           self.activity = os.time()
           return res
         elseif #self.ibuf > MAX_LINE_SIZE then
-          return self:flushread()
+          return self:flushread(noflush)
         end
         local ret = self.socket:read(INCREMENTAL_CHUNK_SIZE)
-        if ret == nil then if throw then error(err) end return self:flushread() end
-        if ret == '' then if nonblocking then return self:flushread() else coroutine.yield(self) end end
+        if ret == nil then if throw then error(err) end return self:flushread(noflush) end
+        if ret == '' then if nonblocking then return self:flushread(noflush) else coroutine.yield(self) end end
         self.ibuf = self.ibuf .. ret
       elseif toread == "*all" or toread == "*chunk" then
         local ret = self.socket:read(self, 100*1024)
-        if ret == '' then if nonblocking then return self:flushread() else coroutine.yield(self) end
-        elseif ret == nil then if throw then error(err) end return self:flushread()
+        if ret == '' then if nonblocking then return self:flushread(noflush) else coroutine.yield(self) end
+        elseif ret == nil then if throw then error(err) end return self:flushread(noflush)
         else
           self.ibuf = self.ibuf .. ret
-          if toread == "*chunk" then return self:flushread() end
+          if toread == "*chunk" then return self:flushread(noflush) end
         end
       end
     end
   end
 end
+function CoSocket:peek(len) return self:read(len, true, false, true) end
 
 function CoSocket:write(chunk)
   self.activity = os.time()
   return self.socket:write(chunk)
 end
 function CoSocket:close(...) return self.socket:close() end
-function CoSocket.connect(...) return setmetatable({ socket = Socket.connect(), pending = {}, activity = os.time() }, CoSocket) end
+function CoSocket.connect(parent, ...)
+  local client = setmetatable({ socket = Socket.connect(...), pending = {}, activity = os.time(), client = parent }, CoSocket)
+  coroutine.yield(client)
+  return client
+end
 function CoSocket.listen(...) return setmetatable({ socket = Socket.listen(...), pending = {}, activity = os.time() }, CoSocket) end
 function CoSocket:accept(...)
   local socket = self.socket:accept()
   if not socket then return nil end
-  local client = setmetatable({ socket = socket, pending = {}, activity = os.time(), server = self.server }, CoSocket)
+  local client = setmetatable({ socket = socket, pending = {}, activity = os.time(), server = self.server, forwards = {} }, CoSocket)
   client.ip = socket:peer()
   return client
 end
+function CoSocket:handshake(...)
+  while self.server.ssl and not self.socket:handshake(self.server.ssl) do
+    coroutine.yield(self)
+  end
+end
+
 local old_pending_add = Pending.add
 function Pending:add(cosocket)
   if not self.mapping then self.mapping = {} end
@@ -120,14 +136,14 @@ function common.args(arguments, options, start_index, end_index)
       if not flag_type then error("unknown flag --" .. option) end
       if flag_type == "flag" then
         args[option] = true
-      elseif flag_type == "string" or flag_type == "number" then
+      elseif flag_type == "string" or flag_type == "number" or flag_type == "integer" then
         if not value or value == "" then
           if i >= #arguments then error("option " .. option .. " requires a " .. flag_type) end
           value = arguments[i+1]
           i = i + 1
         end
-        if flag_type == "number" and tonumber(flag_type) == nil then error("option " .. option .. " should be a number") end
-        args[option] = value
+        if flag_type == "number" or flag_type == "integer" and tonumber(value) == nil then error("option " .. option .. " should be a number") end
+        args[option] = flag_type == "number" or flag_type == "integer" and tonumber(value) or value
       end
     else
       table.insert(args, arguments[i])
@@ -166,12 +182,13 @@ local codes = {
   [507] = "Insufficient Storage", [508] = "Loop Detected", [510] = "Not Extended", [511] = "Network Authentication Required", [512] = "Bad Gateway"
 }
 
-function Request.parse(socket)
-  local _, _, method, path, version = socket:read("*line", false, true):find("^(%w+) (%S+) HTTP/([%d%.]+)$")
+function Request.parse(socket, nonblocking)
+  if nonblocking and not socket:peek(MAX_HEADER_SIZE):find("\r\n\r\n") then return nil end
+  local _, _, method, path, version = socket:read("*line", nonblocking, true):find("^(%w+) (%S+) HTTP/([%d%.]+)$")
   if not method then error("malformed request line") end
   local headers = {}
   while true do
-    local line = socket:read("*line")
+    local line = socket:read("*line", nonblocking)
     if line == '' then break end
     local s,e = line:find("%s*:%s*")
     if not s then error("malformed header") end
@@ -187,7 +204,8 @@ function Request.write(method, path, headers)
 end
 
 
-function Response.parse(socket)
+function Response.parse(socket, nonblocking)
+  if nonblocking and not socket:peek(MAX_HEADER_SIZE):find("\r\n\r\n") then return nil end
   local _, _, version, code, status = socket:read("*line"):find("^HTTP/([%d%.]+) (%d+) (.*)$")
   if not version then error("malformed request line") end
   local headers = {}
@@ -202,7 +220,7 @@ function Response.parse(socket)
 end
 
 function Response.write(code, headers)
-  local chunk = "HTTP/1.1 " .. code .. " " .. codes[code] .. "\r\n"
+  local chunk = "HTTP/1.1 " .. code .. " " .. (codes[code] or "Unknown") .. "\r\n"
   for k,v in pairs(headers or { ["Content-Length"] = 0 }) do chunk = chunk .. (k .. ": " .. v .. "\r\n") end
   return chunk .."\r\n"
 end
@@ -238,7 +256,7 @@ local mime_types = {
   oga = "audio/ogg", ogv = "video/ogg", ogx = "application/ogg", opus = "audio/opus", otf = "font/otf", png = "image/png", pdf = "application/pdf", php = "application/x-httpd-php", ppt = "application/vnd.ms-powerpoint", pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   rar = "application/vnd.rar", rtf = "application/rtf", sh = "application/x-sh", svg = "image/svg+xml", tar = "application/x-tar", tif = "image/tiff", tiff = "image/tiff", ts = "video/mp2t", ttf = "font/ttf", txt = "text/plain", vsd = "application/vnd.visio", wav = "audio/wav", weba = "audio/webm", webm = "video/webm",
   webp = "image/webp", woff = "font/woff", woff2 = "font/woff2", xhtml = "application/xhtml+xml", xls = "application/vnd.ms-excel", xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xml = "application/xml", xul = "application/vnd.mozilla.xul+xml", zip = "application/zip",
-  ["3gp"] = "video/3gpp", ["3g2"] = "video/3gpp2", ["7z"] = "application/x-7z-compressed"
+  ["3gp"] = "video/3gpp", ["3g2"] = "video/3gpp2", ["7z"] = "application/x-7z-compressed", md = "text/markdown"
 }
 
 local function get_mime_type(path)
@@ -266,7 +284,7 @@ function Location:handle(socket, request) -- Originally called when we've receiv
     local anchor = type(self.options.static) == "string" and self.options.static or "."
     local stat = system.stat(anchor)
     local s,e = request.path:find("^" .. self.path)
-    local target = stat.type == "dir" and (anchor .. PATHSEP .. request.path:sub(e + 1))  or anchor
+    local target = stat.type == "dir" and (anchor .. PATHSEP .. request.path:sub(e + 1)) or anchor
     stat = system.stat(target)
     if not stat then error({ 404 }) end
     if stat.type == "dir" then target = target .. PATHSEP .. (self.options.index or "index.html") end
@@ -286,18 +304,43 @@ function Location:handle(socket, request) -- Originally called when we've receiv
   elseif self.options.forward then -- in this case, obuf on the forward client is headed out to upstream, ibuf, returning from upstream.
     local _, _, protocol, host, port = self.options.forward:find("^(%w+)://([^:]+):?(%d*)$")
     if not protocol then error("can't parse forwarding string " .. self.options.forward) end
-    local client, err = pcall(CoSocket.connect, protocol, host, port)  -- this is blocking for now, may want to change this in future.
-    if err then
-      socket:log(err)
-      error({ 512 })
+    local client
+    if not socket.forwards[self.options.forward] then
+      local status, new_client = pcall(CoSocket.connect, socket, protocol, host, port)  -- this is blocking for now, may want to change this in future.
+      if not status then
+        socket:log(new_client)
+        error({ 512 })
+      end
+      socket.forwards[self.options.forward] = new_client
+      client = new_client
     end
     client:write(Request.write(request.method, request.path, request.headers))
+    local outgoing_response
+    local content_length_left = nil
     while true do
+      local connected_incoming = true
+      local connected_outgoing = true
       local incoming_chunk = socket:read(FORWARD_CHUNK_SIZE, true)
-      if incoming_chunk and incoming_chunk ~= '' then client:write(incoming_chunk) end
-      local outgoing_chunk = client:read(FORWARD_CHUNK_SIZE, true)
-      if outgoing_chunk and outgoing_chunk ~= '' then socket:write(outgoing_chunk) end
-      if not incoming_chunk or not outgoing_chunk then
+      if incoming_chunk and #incoming_chunk > 0 then client:write(incoming_chunk) end
+      if not outgoing_response then
+        outgoing_response = Response.parse(client, true)
+        if outgoing_response then
+          response.code = self.options.code or outgoing_response.code
+          response.headers = common.merge(outgoing_response.headers, response.headers)
+          socket:write(Response.write(response.code, response.headers))
+          content_length_left = outgoing_response.headers.content_length
+        end
+      else
+        local outgoing_chunk = client:read(content_length_left or FORWARD_CHUNK_SIZE, true)
+        if outgoing_chunk and #outgoing_chunk > 0 then
+          socket:write(outgoing_chunk)
+          if content_length_left then
+            content_length_left = content_length_left - #outgoing_chunk
+            if content_length_left == 0 then break end
+          end
+        end
+      end
+      if not connected_incoming or not connected_outgoing then
         socket:close()
         client:close()
         break
@@ -323,12 +366,19 @@ end
 
 
 local function parse_function_or_path(path_or_function)
-  if path_or_function:find(".lua$") then return load(path_or_function) end
-  return loadfile(path_or_function)
+  local chunk, err
+  if not path_or_function:find(".lua$") then
+    chunk, err = load(path_or_function)
+  else
+    chunk, err = loadfile(path_or_function)
+  end
+  if not chunk then error(err) end
+  return chunk
 end
 
 local function incoming_request(socket)
   xpcall(function()
+    socket:handshake()
     socket.processing = true
     local request = Request.parse(socket)
     local request_host = request.headers.host:gsub(":*$", "")
@@ -345,31 +395,42 @@ local function incoming_request(socket)
       local code = codes[err[1]] and err[1] or 500
       socket:write(Response.write(code, { ["Content-Length"] = #body, ["Content-Type"] = "text/plain" }))
       socket:write(body)
+      socket:log("< " .. code .. " " .. #body)
     else
-      io.stderr:write(debug.traceback(err, 3))
+      if socket.processing then
+        local body = "Internal Server Error"
+        socket:write(Response.write(code, { ["Content-Length"] = #body, ["Content-Type"] = "text/plain" }))
+        socket:write(body)
+        socket:log("< " .. code .. " " .. #body)
+      end
+      if socket.server.options.verbose then
+        io.stderr:write(err .. "\n")
+        io.stderr:write(debug.traceback(nil, 3) .. "\n")
+      end
     end
     socket:close()
   end)
+  if socket.server.options.once then socket.server.done = true end
   socket.processing = false
 end
 
 xpcall(function()
   local server_idx = common.find(ARGV, { "server", "sserver" })
   local options = {
-    ssl_cert = "string", ssl_key = "string", ssl_callback = "string", location = "string",
+    ssl_cert = "string", ssl_key = "string", ssl = "string", location = "string",
     static = "string", forward = "string", timeout = "integer", code = "integer",
     header = "list", body = "string", callback = "string", error = "string",
     stdout = "string", stderr = "string", compress = "string", inherit = "string",
     redirect = "string", verbose = "flag", version = "flag", help = "flag", plugin = "string",
     host = "string", gnu = "flag", get = "flag", post = "flag", put = "flag", delete = "flag",
     server = "string", location = "string", host = "string", date = "flag", ["lets-encrypt"] = "string",
-    sserver = "flag", hostdir = "string"
+    sserver = "flag", hostdir = "string", once = "flag"
   }
   if ARGV[2] == "test" then
     rawset(_G, 'arg', { select(4, table.unpack(ARGV)) })
     dofile(ARGV[3])
   end
-  local ARGS = common.args(ARGV, options, 1, server_idx and (server_idx - 1))
+  local ARGS = common.args(ARGV, options, 2, server_idx and (server_idx - 1))
   if ARGS["version"] then print(VERSION) return 0 end
   if ARGS["help"] then
     io.stderr:write([[
@@ -449,8 +510,9 @@ Host Flags
 
   --ssl_cert=path     Specifies the certificate path.
   --ssl_key=path      Specifies the private key.
-  --ssl_callback=...  Specifies a literal lua function body to return
-                      [certificate, private_key], taking (hostname).
+  --ssl=...           Specifies a literal lua function body to return
+                      [certificate, private_key, ca_chain], taking (hostname).
+                      ca_chain is optional.
                       If it specifies a path, will load the lua file/shared
                       library at that location, and call it.
   --lets-encrypt=path Specifies your let's encrypt private key. If specified
@@ -498,6 +560,7 @@ Location Flags
   --gnu               Adds 'X-Clacks-Overhead: GNU Terry Pratchett' header.
   --date              Adds thes 'Date' header to the response.
   --[get|post|...]    Limits interactions to only these methods.
+  --once              Runs for one request.
 
 Examples
 
@@ -508,7 +571,7 @@ Examples
   end
   local all_servers = {}
   local connection_id = 0
-  if not server_idx then server_idx = 1 end
+  if not server_idx then server_idx = 2 end
   while server_idx do
     local servers, host_idx, next_host_idx, server_options
     local next_server_idx = common.find(ARGV, { "server", "sserver" }, server_idx + 1)
@@ -526,7 +589,7 @@ Examples
         for _, server in ipairs(servers) do
           hosts = hosts or { Host.new(server, host_options.host or ".*", host_options) }
           for _, host in ipairs(hosts) do
-            table.insert(host.locations, Location.new(host, location_options.location or ".*", location_options))
+            table.insert(host.locations, Location.new(host, location_options.location or "/", location_options))
           end
         end
         location_idx = next_location_idx
@@ -553,11 +616,12 @@ Examples
     if server.options.ssl_key or server.options.ssl_cert then
       if not server.options.ssl_key then error("must supply an ssl_key alongside an ssl_cert") end
       if not server.options.ssl_cert then error("must supply an ssl_cert alongside an ssl_key") end
-      ssl = { server.options.ssl_cert, server.options.ssl_key }
-    elseif server.options.ssl_callback then
-      ssl = parse_function_or_path(sever.options.ssl_callback)
+      ssl = function(...) return read(server.options.ssl_cert), read(server.options.ssl_key) end
+    elseif server.options.ssl then
+      ssl = parse_function_or_path(server.options.ssl)
     end
-    server.socket = pending:add(CoSocket.listen(address, port, { ssl = ssl }))
+    server.ssl = ssl
+    server.socket = pending:add(CoSocket.listen(address, port, ssl))
     server.socket.server = server
   end
 
@@ -565,8 +629,18 @@ Examples
   local last_active_check = os.time()
 
   log("Spinning up server...")
-  while true do
-    local socket, event = pending:poll(POLL_MAX_TIME)
+  local active_connections = {} -- Connections that are actively doing something, and not waiting on anything.
+  while #all_servers > 0 do
+    local socket
+    if #active_connections > 0 then
+      socket = pending:poll(0)
+      if not socket then
+        socket = active_connections[1]
+        if socket then table.remove(active_connections, 1) end
+      end
+    else
+      socket = pending:poll(POLL_MAX_TIME)
+    end
     local time = os.time()
     if time - last_active_check > INACTIVITY_CHECK_TIME and #clients > 0 then
       local connections = {}
@@ -585,7 +659,7 @@ Examples
     end
 
     if socket then
-      if not socket.coroutine then
+      if not socket.client then
         local client = socket:accept()
         connection_id = connection_id + 1
         client.id = connection_id
@@ -593,20 +667,28 @@ Examples
         client.client = client
         socket = client
       else
-        for _,v in ipairs(socket.client.pending) do pending:remove(v) end
-        socket.client.pending = {}
+        socket = socket.client
       end
+      for _,v in ipairs(socket.client.pending) do pending:remove(v) end
+      socket.client.pending = {}
       socket.coroutine = socket.coroutine or coroutine.create(incoming_request)
       local waiting = { select(2, coroutine.resume(socket.coroutine, socket)) }
-      if #waiting > 0 then
-        socket.client.pending = waiting
-        for i = 1, #waiting do pending:add(waiting[i]) end
-      end
       if coroutine.status(socket.coroutine) == 'dead' then
         socket.coroutine = nil
       end
+      if #waiting > 0 then
+        socket.client.pending = waiting
+        for i = 1, #waiting do pending:add(waiting[i]) end
+      elseif socket.coroutine then
+        table.insert(active_connections, socket)
+      end
+      if socket.server.done then
+        pending:remove(socket.server.socket)
+        all_servers = filter(all_servers, function(s) return s ~= socket.server end)
+      end
     end
   end
+  log("Done.")
 end, function(err)
   io.stderr:write(err:gsub("^src/main.lua:%d*:%s*", "") .. "\n")
   if LIVE then io.stderr:write(debug.traceback(nil, 2) .. "\n") end

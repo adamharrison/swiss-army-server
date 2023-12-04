@@ -6,7 +6,8 @@
 : ${JOBS=4}
 
 SRCS="src/*.c"
-LDFLAGS="$LDFLAGS -lm -static-libgcc -Wl,-Bstatic"
+CFLAGS="$CFLAGS -I`pwd`/lib/prefix/include"
+LDFLAGS="$LDFLAGS -L`pwd`/lib/prefix/lib -lm -static-libgcc -Wl,-Bstatic"
 CMAKE_DEFAULT_FLAGS=" $CMAKE_DEFAULT_FLAGS -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=`pwd`/lib/prefix -DCMAKE_INSTALL_PREFIX=`pwd`/lib/prefix -DBUILD_SHARED_LIBS=OFF"
 
 [[ "$@" == "clean" ]] && rm -rf lib/zlib/build lib/mbedtls-3.2.1/build lib/prefix $BIN *.exe && exit 0
